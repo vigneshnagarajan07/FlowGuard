@@ -188,13 +188,14 @@ class SubScores(BaseModel):
     Intermediate Step-1 sub-scores.  All in [0, 1].
     Exposed so the NLP layer can narrate exactly why a decision was made.
     """
-    P: float = Field(..., ge=0, le=1, description="Penalty score")
-    U: float = Field(..., ge=0, le=1, description="Urgency score")
-    L: float = Field(..., ge=0, le=1, description="Legal score")
-    C: float = Field(..., ge=0, le=1, description="Contagion score")
-    R: float = Field(..., ge=0, le=1, description="Relationship score")
-    F: float = Field(..., ge=0, le=1, description="Flexibility (discount)")
-    blended: float = Field(..., ge=0, le=1, description="Weighted blend before ceiling")
+    P: float = Field(..., ge=0, le=1, description="Penalty score — financial cost of deferral")
+    U: float = Field(..., ge=0, le=1, description="Urgency score — time proximity to due date")
+    L: float = Field(..., ge=0, le=1, description="Legal score — statutory / court risk")
+    C: float = Field(..., ge=0, le=1, description="Contagion score — cascade failure fraction")
+    R: float = Field(..., ge=0, le=1, description="Relationship score — counterparty importance")
+    KA: float = Field(0.0, ge=0, le=1, description="Cash Absorption — fraction of available cash consumed")
+    F: float = Field(..., ge=0, le=1, description="Flexibility discount — deferral headroom (lower is better)")
+    blended: float = Field(..., ge=0, le=1, description="Weighted blend before type ceiling")
     type_ceiling: float = Field(..., ge=0, le=1)
 
 

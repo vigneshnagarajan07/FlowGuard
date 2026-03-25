@@ -24,13 +24,16 @@
             "DEFERRABLE":  1.0
         },
         "sub_score_weights": {
-            "P": 0.25,
-            "U": 0.25,
-            "L": 0.25,
-            "C": 0.15,
-            "R": 0.10,
-            "F": 0.08
+            "P":  0.22,
+            "U":  0.22,
+            "L":  0.22,
+            "C":  0.14,
+            "R":  0.10,
+            "KA": 0.10,
+            "F":  0.07
         },
+        "overdue_multiplier": 1.30,
+        "recurrence_bonus": 5.0,
         "penalty_cap_inr": 500000,
         "urgency_zero_days": 90,
         "statutory_urgent_floor": 95.0,

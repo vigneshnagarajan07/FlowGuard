@@ -1,24 +1,39 @@
 """
 flowguard/engine/scorer.py
 ──────────────────────────
-The deterministic Consequence Score engine.
+The deterministic Consequence Score engine.  This is the CORE of FlowGuard.
+All downstream LLM narration, FILTER responses, and payment recommendations
+are DRIVEN by these scores.  The LLM merely explains — never overrides.
 
 IRON RULE: No LLM, no randomness, no network calls.
 Same inputs → identical outputs, every run.
 
-Formula (3 steps):
-  Step 1  blended = clamp(0.25·P + 0.25·U + 0.25·L + 0.15·C + 0.10·R − 0.08·F, 0, 1)
+Formula (4 steps):
+  Step 1  blended = clamp(0.22·P + 0.22·U + 0.22·L + 0.14·C + 0.10·R + 0.10·KA − 0.07·F, 0, 1)
   Step 2  pre_floor_cs = type_ceiling(category) × blended × 100
   Step 3  cs = max(pre_floor_cs, domain_floor(category))
+  Step 3b overdue multiplier: if past due, cs × 1.3 (capped at 100)
+  Step 3c recurrence boost: +5 cs if is_recurring (capped at 100)
+
+Sub-scores:
+  P   = Penalty score        — financial cost of deferral
+  U   = Urgency score        — time proximity to due date
+  L   = Legal score          — statutory / court risk level
+  C   = Contagion score      — cascade failure fraction
+  R   = Relationship score   — counterparty importance
+  KA  = Cash Absorption      — fraction of available cash this obligation consumes
+  F   = Flexibility discount — deferral headroom (negative contribution)
 
 Edge cases handled:
-  • due_date in the past        → urgency = 1.0 (treat as overdue)
-  • zero cash                   → all actions default to NEGOTIATE / ESCALATE
+  • due_date in the past        → urgency = 1.0 + 1.3× overdue multiplier
+  • zero cash                   → KA = 1.0 for all; all actions default to NEGOTIATE/ESCALATE
   • cascading failures          → contagion computed from graph traversal
   • identical CS ties           → tie-broken by amount DESC (bigger bill first)
-  • GST / statutory < 24 h     → score pinned to 95 minimum (CRITICAL band)
-  • amount > 10× available cash → confidence penalty applied
+  • GST/statutory < 24 h        → score pinned to 95 minimum (CRITICAL band)
+  • amount > 10× available cash → KA = 1.0 (confidence penalty also applied)
   • max_deferral_days = 0       → flexibility forced to FIXED regardless of input
+  • is_recurring = True         → +5 CS bonus (recurring bills must stay current)
+  • DEFER/NEGOTIATE action_date → explicitly computed from due_date and deferral window
 """
 
 from __future__ import annotations
@@ -105,14 +120,21 @@ FLEXIBILITY_DISCOUNT: dict[FlexibilityLevel, float] = _enum_dict(
     _ENGINE_CFG.get("flexibility_discount", _DEFAULT_FLEX), FlexibilityLevel
 )
 
-# Sub-score weights
+# Sub-score weights  (now 7 components — updated from v1 config)
 _weights = _ENGINE_CFG.get("sub_score_weights", {})
-W_P = _weights.get("P", 0.25)
-W_U = _weights.get("U", 0.25)
-W_L = _weights.get("L", 0.25)
-W_C = _weights.get("C", 0.15)
-W_R = _weights.get("R", 0.10)
-W_F = _weights.get("F", 0.08)
+W_P  = _weights.get("P",  0.22)   # Penalty score
+W_U  = _weights.get("U",  0.22)   # Urgency
+W_L  = _weights.get("L",  0.22)   # Legal risk
+W_C  = _weights.get("C",  0.14)   # Contagion
+W_R  = _weights.get("R",  0.10)   # Relationship
+W_KA = _weights.get("KA", 0.10)   # Cash absorption (NEW)
+W_F  = _weights.get("F",  0.07)   # Flexibility discount (reduced slightly)
+
+# Overdue severity multiplier (NEW)
+OVERDUE_MULTIPLIER = _ENGINE_CFG.get("overdue_multiplier", 1.30)
+
+# Recurrence CS bonus (NEW): recurring bills must stay current
+RECURRENCE_BONUS = _ENGINE_CFG.get("recurrence_bonus", 5.0)
 
 # Score band thresholds
 _band_map = {"CRITICAL": ScoreBand.CRITICAL, "HIGH": ScoreBand.HIGH,
@@ -250,6 +272,27 @@ def _relationship_score_normalised(ob: Obligation) -> float:
     return ob.relationship_score / 100.0
 
 
+def _cash_absorption_score(
+    ob: Obligation,
+    available_cash: float,
+) -> float:
+    """
+    KA ∈ [0, 1].  NEW in v2.
+    Measures how much of available cash this single obligation would consume.
+    High KA = paying this nearly empties the tank, leaving zero buffer.
+
+    KA = 0.0  if obligation is tiny relative to cash (< 10% of available)
+    KA = 1.0  if amount >= available cash (paying this = zero balance or overdraft)
+
+    Edge: if available_cash == 0, KA = 1.0 for all (nothing is affordable).
+    """
+    if available_cash <= 0:
+        return 1.0
+    ratio = ob.amount_inr / available_cash
+    # Smooth sigmoid-style: below 0.1 ratio → ~0; at ratio=1 → ~1
+    return _clamp(ratio, 0.0, 1.0)
+
+
 def _flexibility_score(ob: Obligation) -> float:
     """
     F ∈ [0, 1].  The DISCOUNT factor.
@@ -292,21 +335,27 @@ def compute_consequence_score(
     """
     Returns (final_cs, sub_scores).
 
-    Step 1: blended sub-score
+    Step 1: blended sub-score (7 components)
     Step 2: multiply by type_ceiling
     Step 3: apply domain floor
-    Step 3b: statutory urgent pin (< 24 h due)
+    Step 3b: overdue multiplier (1.3× if past due)
+    Step 3c: recurrence bonus (+5 if is_recurring)
+    Step 3d: statutory urgent pin (< 24 h)
     """
     today = cash_position.as_of_date
+    available = cash_position.available_cash_inr
 
-    P = _penalty_score(ob, today)
-    U = _urgency_score(ob, today)
-    L = _legal_score(ob)
-    C = _contagion_score(ob, all_obligations, cash_position.available_cash_inr)
-    R = _relationship_score_normalised(ob)
-    F = _flexibility_score(ob)
+    P  = _penalty_score(ob, today)
+    U  = _urgency_score(ob, today)
+    L  = _legal_score(ob)
+    C  = _contagion_score(ob, all_obligations, available)
+    R  = _relationship_score_normalised(ob)
+    KA = _cash_absorption_score(ob, available)
+    F  = _flexibility_score(ob)
 
-    blended = _clamp(W_P * P + W_U * U + W_L * L + W_C * C + W_R * R - W_F * F)
+    blended = _clamp(
+        W_P * P + W_U * U + W_L * L + W_C * C + W_R * R + W_KA * KA - W_F * F
+    )
     ceiling = TYPE_CEILING[ob.category]
     pre_floor_cs = ceiling * blended * 100
 
@@ -314,9 +363,18 @@ def compute_consequence_score(
     floor = DOMAIN_FLOOR[ob.category]
     cs = max(pre_floor_cs, floor)
 
-    # Edge: statutory + due within 24 h → hard pin
+    # Step 3b: overdue multiplier — past-due obligations are MORE urgent
+    days_left = (ob.due_date - today).days
+    if days_left < 0:
+        cs = min(cs * OVERDUE_MULTIPLIER, 100.0)
+
+    # Step 3c: recurrence boost — recurring bills must stay current
+    if ob.is_recurring:
+        cs = min(cs + RECURRENCE_BONUS, 100.0)
+
+    # Step 3d: statutory + due within 24 h → hard pin
     if ob.category == ObligationCategory.STATUTORY:
-        hours_left = (ob.due_date - today).days * 24
+        hours_left = days_left * 24
         if hours_left <= STATUTORY_URGENT_HOURS:
             cs = max(cs, STATUTORY_URGENT_FLOOR)
 
@@ -327,8 +385,10 @@ def compute_consequence_score(
         C=round(C, 4), R=round(R, 4), F=round(F, 4),
         blended=round(blended, 4),
         type_ceiling=ceiling,
+        KA=round(KA, 4),
     )
     return round(cs, 2), sub_scores
+
 
 
 # ─────────────────────────────────────────────
@@ -434,43 +494,82 @@ def _build_cot(
     action: ActionTag,
     action_date: Optional[date],
     penalty_per_day: float,
+    available_cash: float = 0.0,
     today: Optional[date] = None,
 ) -> dict[str, str]:
     """
     Returns the 4-part COT as plain English strings.
+    Enhanced v2: includes all sub-score drivers, cash impact, and recurrence context.
     These are ALREADY human-readable — the NLP layer can pass them
     through unchanged or rephrase them for the output channel.
     """
-    band = _score_band(cs)
+    band   = _score_band(cs)
     _today = today or date.today()
-    days_left = (ob.due_date - _today).days if ob.due_date else "?"
+    days_left = (ob.due_date - _today).days if ob.due_date else 0
 
     act = f"{action.value} ₹{ob.amount_inr:,.0f} to {ob.counterparty_name}"
     if action_date:
         act += f" by {action_date.strftime('%d %b %Y')}"
 
-    reason_parts = []
+    # ── Reason: surface the dominant drivers ──
+    drivers = []
     if sub_scores.L >= 0.5:
-        reason_parts.append("carries legal / criminal risk")
-    if sub_scores.U >= 0.8:
-        reason_parts.append(f"due in {days_left} day(s)")
-    if sub_scores.P >= 0.5:
-        reason_parts.append(f"daily penalty ₹{penalty_per_day:,.0f}")
-    if not reason_parts:
-        reason_parts.append(f"Consequence Score {cs:.1f} ({band.value})")
-    reason = f"Consequence Score {cs:.1f} ({band.value}) — " + ", ".join(reason_parts) + "."
+        drivers.append("carries LEGAL risk (prosecution/court exposure)")
+    if days_left < 0:
+        drivers.append(f"OVERDUE by {abs(days_left)} day(s)")
+    elif sub_scores.U >= 0.7:
+        drivers.append(f"due in {days_left} day(s) (URGENT)")
+    if sub_scores.P >= 0.4:
+        drivers.append(f"daily penalty ₹{penalty_per_day:,.0f}")
+    if sub_scores.C >= 0.5:
+        drivers.append("failure cascades to other obligations")
+    if sub_scores.KA >= 0.7:
+        pct = sub_scores.KA * 100
+        drivers.append(f"consumes ~{pct:.0f}% of available cash")
+    if ob.is_recurring:
+        drivers.append("recurring bill — missing this harms credit history")
+    if not drivers:
+        drivers.append(f"CS {cs:.1f} ({band.value})")
 
-    tradeoff = (
-        f"Deferring by 1 day costs ₹{penalty_per_day:,.0f}."
-        if penalty_per_day > 0
-        else "No direct financial penalty for deferral, but relationship risk applies."
+    reason = f"CS {cs:.1f} ({band.value}) | " + " | ".join(drivers) + "."
+
+    # ── Sub-score breakdown for explainability ──
+    reason += (
+        f"  [P={sub_scores.P:.2f} U={sub_scores.U:.2f} L={sub_scores.L:.2f}"
+        f" C={sub_scores.C:.2f} R={sub_scores.R:.2f} KA={sub_scores.KA:.2f} F={sub_scores.F:.2f}]"
     )
 
-    downstream = (
-        "Paying this frees remaining cash for lower-priority obligations."
-        if action == ActionTag.PAY
-        else f"Deferring to {action_date} allows cash to be used for higher-priority payments first."
-    )
+    # ── Tradeoff: daily burn rate ──
+    if penalty_per_day > 0:
+        tradeoff = (
+            f"Deferring costs ₹{penalty_per_day:,.0f}/day. "
+            f"After {ob.max_deferral_days or 1} day(s): ₹{penalty_per_day * max(ob.max_deferral_days,1):,.0f} total."
+        )
+    else:
+        tradeoff = "No direct penalty, but relationship score and supply chain continuity at risk."
+
+    # ── Downstream: cash impact ──
+    remaining_after = max(available_cash - ob.amount_inr, 0)
+    if action == ActionTag.PAY:
+        downstream = (
+            f"Paying leaves ₹{remaining_after:,.0f} available. "
+            "Clears this obligation entirely and preserves creditworthiness."
+        )
+    elif action == ActionTag.ESCALATE:
+        downstream = (
+            "Immediate escalation needed — seek emergency credit or overdraft. "
+            "Missing this payment could trigger legal action or bank-account freeze."
+        )
+    elif action == ActionTag.NEGOTIATE:
+        downstream = (
+            f"Negotiating a revised date frees ₹{ob.amount_inr:,.0f} for higher-priority "
+            "obligations. Relationship score must be ≥ 50 to succeed."
+        )
+    else:
+        downstream = (
+            f"Deferring to {action_date.strftime('%d %b') if action_date else 'a later date'} "
+            f"frees ₹{ob.amount_inr:,.0f} for higher-priority obligations today."
+        )
 
     return {
         "cot_action":     act,
@@ -478,6 +577,7 @@ def _build_cot(
         "cot_tradeoff":   tradeoff,
         "cot_downstream": downstream,
     }
+
 
 
 def _input_hash(ob: Obligation) -> str:
@@ -529,12 +629,12 @@ def run_engine(
         penalty_per_day = (ob.amount_inr * ob.penalty_rate_annual_pct / 100) / 365
         penalty_if_deferred = penalty_per_day * max(ob.max_deferral_days, 1)
 
-        # Determine action
+        # Determine action and smart action_date
         if remaining_cash >= ob.amount_inr:
             action = ActionTag.PAY
             allocated = ob.amount_inr
             remaining_cash -= allocated
-            action_date = today  # pay now
+            action_date = today  # pay today
         elif ob.partial_payment_pct > 0 and remaining_cash >= ob.amount_inr * ob.partial_payment_pct:
             # Partial payment: allocate the allowed fraction
             action = ActionTag.NEGOTIATE
@@ -553,12 +653,21 @@ def run_engine(
         elif ob.flexibility == FlexibilityLevel.NEGOTIABLE:
             action = ActionTag.NEGOTIATE
             allocated = 0.0
-            # Suggest deferral to when next inflow covers it
-            action_date = None
+            # Smart action_date: suggest the midpoint of deferral window or due date
+            deferral_window = max(ob.max_deferral_days, 1)
+            action_date = min(
+                ob.due_date,
+                date.fromordinal(today.toordinal() + deferral_window // 2 + 1),
+            )
         else:
             action = ActionTag.DEFER
             allocated = 0.0
-            action_date = None
+            # Smart action_date: latest safe date (due_date or max_deferral_days out)
+            deferral_window = max(ob.max_deferral_days, 1)
+            action_date = min(
+                ob.due_date,
+                date.fromordinal(today.toordinal() + deferral_window),
+            )
 
         cash_coverage = available / ob.amount_inr if ob.amount_inr > 0 else 99.0
         confidence, basis = _confidence(
@@ -566,7 +675,11 @@ def run_engine(
             cash_is_verified=cash_position.cash_is_verified,
         )
 
-        cot = _build_cot(ob, cs, subs, action, action_date, penalty_per_day, today=today)
+        cot = _build_cot(
+            ob, cs, subs, action, action_date, penalty_per_day,
+            available_cash=available,
+            today=today,
+        )
 
         decisions.append(DecisionRecord(
             obligation_id=ob.obligation_id,
@@ -590,13 +703,18 @@ def run_engine(
             **cot,
         ))
 
-    # ── Step D: days-to-zero projection ───────
+    # ── Step D: days-to-zero projection ───────────────────────────────
     daily_outflows = _compute_daily_outflows(decisions, today)
     crisis_day, deficit = _days_to_zero(
         available, cash_position.expected_inflows, daily_outflows
     )
 
-    return EngineResult(
+    # ── Step E: aggregate penalty exposure ─────────────────────────────
+    # Total daily burn rate if ALL deferred obligations keep accruing penalty
+    deferred_decisions = [d for d in decisions if d.action in (ActionTag.DEFER, ActionTag.NEGOTIATE)]
+    total_penalty_exposure = sum(d.penalty_per_day_inr for d in deferred_decisions)
+
+    result = EngineResult(
         run_id=str(uuid.uuid4())[:8],
         as_of_date=today,
         available_cash_inr=available,
@@ -606,3 +724,9 @@ def run_engine(
         days_to_zero=crisis_day,
         deficit_on_crisis_day_inr=deficit,
     )
+
+    # Attach penalty exposure as extra metadata (not in Pydantic model — safe to add)
+    object.__setattr__(result, "total_penalty_exposure_per_day_inr",
+                       round(total_penalty_exposure, 2))
+
+    return result
