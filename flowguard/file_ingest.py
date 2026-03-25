@@ -56,12 +56,17 @@ except ImportError:
 # OCR: PaddleOCR
 try:
     from paddleocr import PaddleOCR
-    _paddle_ocr = PaddleOCR(use_angle_cls=True, lang="en", show_log=False)
+    try:
+        _paddle_ocr = PaddleOCR(use_angle_cls=True, lang="en", show_log=False)
+    except (ValueError, TypeError):
+        # Older paddleocr versions don't support show_log
+        _paddle_ocr = PaddleOCR(use_angle_cls=True, lang="en")
     OCR_AVAILABLE = True
-except ImportError:
+except Exception:
     OCR_AVAILABLE = False
     _paddle_ocr = None
-    logger.warning("paddleocr not installed — OCR import disabled")
+    logger.warning("paddleocr not available — OCR import disabled")
+
 
 # CSV: Pandas
 try:

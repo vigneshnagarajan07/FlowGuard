@@ -188,7 +188,10 @@
 </div>
 
 <script>
-const API=location.origin; // same server since served from FastAPI
+// If opened via file:// disk, location.origin is "null" — fall back to the backend server.
+const API = (location.protocol === 'file:' || location.origin === 'null')
+  ? 'http://localhost:8000'
+  : location.origin;
 let busy=false, pFile=null;
 const $=id=>document.getElementById(id);
 const esc=s=>String(s||'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
