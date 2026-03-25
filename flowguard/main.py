@@ -121,7 +121,7 @@ from .file_ingest import (
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-ENGINE_VERSION = "1.2.0"
+ENGINE_VERSION = "2.0.0"
 
 # ─────────────────────────────────────────────
 # Audit Store (abstracted for PostgreSQL migration)
@@ -472,7 +472,8 @@ async def health():
     ),
 )
 async def parse(req: NLPParseRequest) -> ScoreRequest:
-    return _parse_raw_to_score_request(req)
+    score_req, _ = _parse_raw_to_score_request(req)  # discard meta, return only ScoreRequest
+    return score_req
 
 
 @app.post(
@@ -644,15 +645,20 @@ async def pipeline(req: NLPParseRequest):
         }
 
     # ── STATUS: full scoring engine ──────────────────────────────────────
-    try:
-        score_req, _ = _parse_raw_to_score_request(req)
-    except HTTPException:
-        # If no obligations parseable, return the bot_reply alone
-        return {
-            "intent":    "STATUS",
-            "bot_reply": bot_reply or "Sure! Analysing your current cash flow…",
-            "note":      "No obligations found in current session. Please ingest some data first.",
-        }
+    # Reuse groq_req if Groq already parsed obligations (avoids a second Groq call).
+    # Fall back to regex parser if groq_req has no obligations.
+    if groq_req and groq_req.obligations:
+        score_req = groq_req
+    else:
+        try:
+            score_req, _ = _parse_raw_to_score_request(req)
+        except HTTPException:
+            # No obligations extractable at all — return the bot_reply alone
+            return {
+                "intent":    "STATUS",
+                "bot_reply": bot_reply or "Sure! Analysing your current cash flow…",
+                "note":      "No obligations found in current session. Please ingest some data first.",
+            }
 
     result = run_engine(
         obligations=score_req.obligations,

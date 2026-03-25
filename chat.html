@@ -274,8 +274,51 @@ function addCard(data){
   scr();
 }
 
+// Route a /pipeline response to the correct UI renderer
+function handleReply(data) {
+  const intent = data.intent || 'STATUS';
+
+  // INGEST: just show the bot_reply confirmation bubble
+  if (intent === 'INGEST') {
+    const msg = data.bot_reply || `✅ Recorded ${(data.stored||[]).length} obligation(s).`;
+    $('chat').insertAdjacentHTML('beforeend',
+      `<div class="row bot"><div class="bubble">${esc(msg)}</div><div class="time">${ts()}</div></div>`);
+    scr(); return;
+  }
+
+  // FILTER: show bot_reply + JSON table of results
+  if (intent === 'FILTER') {
+    const msg = data.bot_reply || 'Fetching records…';
+    const txns = data.transactions || [];
+    const obs  = data.obligations  || [];
+    let rows = '';
+    txns.forEach(t => {
+      rows += `<div class="item MEDIUM"><div class="item-info"><div class="item-name">${esc(t.counterparty||'—')}</div><div class="item-meta">₹${(t.amount_inr||0).toLocaleString('en-IN')} · ${t.direction||''} · ${t.txn_date||''}</div></div><span class="tag NEGOTIATE">${t.medium||''}</span></div>`;
+    });
+    obs.forEach(o => {
+      rows += `<div class="item MEDIUM"><div class="item-info"><div class="item-name">${esc(o.counterparty_name||'—')}</div><div class="item-meta">₹${(o.amount_inr||0).toLocaleString('en-IN')} · Due ${o.due_date||'—'} · ${o.category||''}</div></div><span class="tag DEFER">${o.flexibility||''}</span></div>`;
+    });
+    const card = rows ? `<div class="card"><div class="card-h"><span>Filter Results</span><span class="pill ok">✓ ${(txns.length+obs.length)} found</span></div><div class="card-b">${rows}</div></div>` : '';
+    $('chat').insertAdjacentHTML('beforeend',
+      `<div class="row bot"><div class="bubble">${esc(msg)}</div>${card}<div class="time">${ts()}</div></div>`);
+    scr(); return;
+  }
+
+  // STATUS with no engine_result (e.g. "no obligations found" note)
+  if (!data.engine_result) {
+    const msg = data.bot_reply || data.note || 'No obligations found. Please ingest data first.';
+    $('chat').insertAdjacentHTML('beforeend',
+      `<div class="row bot"><div class="bubble">${esc(msg)}</div><div class="time">${ts()}</div></div>`);
+    scr(); return;
+  }
+
+  // STATUS with full engine_result → decision card
+  addCard(data);
+}
+
 // File upload endpoint routing
 function uploadEndpoint(name){
+
   const e=name.split('.').pop().toLowerCase();
   if(e==='csv')return'/upload/csv';
   if(e==='pdf')return'/upload/pdf';
@@ -351,7 +394,7 @@ async function go(){
       const res=await fetch(API+'/pipeline',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({raw_text:text,language:'en'})});
       rmTyping();
       if(!res.ok){const e=await res.json().catch(()=>({}));addErr('Error: '+(e.detail||e.error||'HTTP '+res.status))}
-      else addCard(await res.json());
+      else handleReply(await res.json());
     }catch{rmTyping();addErr('Cannot reach engine. Make sure the server is running.')}
     finally{busy=false;$('sb').disabled=false;inp.focus()}
     return;
