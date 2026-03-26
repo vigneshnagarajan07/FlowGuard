@@ -1,56 +1,49 @@
 # FlowGuard — Python dependencies
-# Install: pip install -r requirements.txt --break-system-packages
+# Install: pip install -r requirements.txt
 #
-# After install, download spaCy model:
+# After install, optionally download spaCy model:
 #   python -m spacy download en_core_web_sm
-#
-# Optional multilingual model (Tamil/Hindi/Telugu):
-#   python -m spacy download xx_ent_wiki_sm
 
 # ── Web framework ──────────────────────────────────────────────────────
 fastapi>=0.111.0
 uvicorn[standard]>=0.29.0
-python-multipart>=0.0.9      # for Form() in WhatsApp webhook
+python-multipart>=0.0.9      # multipart file uploads
 
 # ── Data validation ────────────────────────────────────────────────────
 pydantic>=2.7.0
 
-# ── NLP STACK (recommended open-source) ───────────────────────────────
-# Primary: spaCy for NER, tokenisation, rule matching
-# Why spaCy: fastest production NLP, runs locally, no API key
-spacy>=3.7.0
+# ── Database ORM ───────────────────────────────────────────────────────
+sqlalchemy>=2.0
 
-# Secondary: sentence-transformers for intent classification
-# Model: all-MiniLM-L6-v2 (~80 MB) — best speed/accuracy for short texts
-# Why: beats plain keywords, doesn't need a full LLM
-sentence-transformers>=2.7.0
-torch>=2.0.0                 # required by sentence-transformers
+# ── LLM Layer: Groq API ───────────────────────────────────────────────
+groq>=0.9.0
+python-dotenv>=1.0.0
+
+# ── File Import: PDF ──────────────────────────────────────────────────
+pdfplumber>=0.10              # PDF text + table extraction
+pypdfium2>=4.0                # PDF page rendering for scanned PDFs
+Pillow>=10.0.0                # Image processing + PNG→JPEG conversion
+
+# ── File Import: Excel / CSV ──────────────────────────────────────────
+pandas>=2.0
+openpyxl>=3.1.0               # .xlsx read/write
+xlrd>=2.0.1                   # .xls legacy support
+
+# ── HTTP client (for tests) ───────────────────────────────────────────
+requests>=2.31.0
+
+# ── NLP (optional — graceful fallback to regex if not installed) ──────
+# spacy>=3.7.0
+# sentence-transformers>=2.7.0
+# torch>=2.0.0
+
+# ── PDF table extraction (optional — needs Ghostscript binary) ─────────
+# camelot-py[cv]>=0.11
 
 # ── Testing ────────────────────────────────────────────────────────────
 pytest>=8.0.0
 pytest-asyncio>=0.23.0
-httpx>=0.27.0                # for FastAPI test client
+httpx>=0.27.0
 
-# ── WhatsApp (Twilio) ──────────────────────────────────────────────────
-twilio>=9.0.0                # only needed if using WhatsApp webhook
-
-# ── Optional: LP solver for advanced allocation ────────────────────────
-# PuLP is referenced in the spec for the constraint solver.
-# The greedy solver in scorer.py handles 95% of cases.
-# Uncomment for large numbers of obligations (10+):
-# pulp>=2.8.0
-
-# ── Database ORM ──────────────────────────────────────────────────────
-sqlalchemy>=2.0
-
-# ── File Import: PDF + OCR + CSV ──────────────────────────────────────
-pdfplumber>=0.10
-camelot-py[cv]>=0.11              # PDF table extraction (needs ghostscript)
-paddleocr>=2.7                    # OCR engine (no Tesseract needed)
-paddlepaddle>=2.5                 # PaddleOCR backend
-Pillow>=10.0.0
-pandas>=2.0                       # CSV / DataFrame ingestion
-
-# ── LLM Layer 2: Groq API (COT narration + input parsing) ────────────
-groq>=0.9.0
-python-dotenv>=1.0.0
+# ── WhatsApp webhook (optional) ────────────────────────────────────────
+# twilio>=9.0.0

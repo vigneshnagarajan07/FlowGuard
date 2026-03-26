@@ -7,7 +7,7 @@ This module is the ONLY place where LLM calls happen.
 The deterministic engine (scorer.py) is NEVER touched by this module.
 
 Model Routing:
-  • llama3-8b-8192        → user input parsing (text → JSON)
+  • llama-3.1-8b-instant  → user input parsing (text → JSON)
   • mixtral-8x7b-32768    → JSON correction fallback
   • llama-3.3-70b-versatile → COT narration + email drafts
 
@@ -60,8 +60,8 @@ else:
 # MODEL CONSTANTS
 # ─────────────────────────────────────────────
 
-MODEL_PARSE    = "llama3-8b-8192"           # Fast, cheap — input parsing
-MODEL_FIXJSON  = "mixtral-8x7b-32768"       # Good at structured correction
+MODEL_PARSE    = "llama-3.1-8b-instant"     # Fast, cheap — input parsing (replaces decommissioned llama3-8b-8192)
+MODEL_FIXJSON  = "llama-3.1-8b-instant"    # Good at structured correction
 MODEL_NARRATE  = "llama-3.3-70b-versatile"  # Best quality — narration + email
 _MODEL         = MODEL_PARSE                 # Alias used by file_ingest.py
 
@@ -133,12 +133,13 @@ def _groq_chat_text(
 
 
 # ─────────────────────────────────────────────
-# 1. INPUT PARSING — llama3-8b
+# 1. INPUT PARSING — llama-3.1-8b-instant
 # ─────────────────────────────────────────────
 
 _PARSE_SYSTEM = """
-You are FlowGuard's intelligent financial assistant for Indian MSMEs (Micro, Small, Medium Enterprises).
-You support Tamil and English ONLY. Detect the user's language and reply in the same language.
+You are FlowGuard — a smart, proactive financial co-pilot for Indian MSMEs.
+You support Tamil and English. Always detect the user's language and reply in the same language.
+You MUST always include concrete ₹ numbers and financial stats in every bot_reply. Never give vague replies.
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━
 STEP 1 — CLASSIFY INTENT
@@ -230,37 +231,53 @@ STEP 3 — EXTRACT DATA (based on intent)
   • date_from / date_to — ISO date strings YYYY-MM-DD
 
   ── If STATUS ──
-  No data extraction needed. Just confirm intent.
+  No data extraction needed. Confirm intent and add an encouraging line.
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━
-STEP 4 — GENERATE BOT REPLY
+STEP 4 — COMPUTE INLINE STATS
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━
-Generate a short, natural language reply (in the SAME language as the user's message — Tamil or English):
+Always compute these stats from what the user said. Use 0/null if unknown.
 
-• If INGEST (new data):
-  English: "✅ Got it! Recorded [N] obligation(s). Sharma Papers ₹50,000 due 28 Mar → logged."
-  Tamil: "✅ சரி! [N] கடமை(கள்) பதிவு செய்யப்பட்டது. Sharma Papers ₹50,000 → சேமிக்கப்பட்டது."
+  stats.obligations_this_message → count of obligations extracted right now
+  stats.total_amount_due_inr     → sum of all obligation amounts in this message
+  stats.cash_balance_inr         → cash the user HAS (from this message or context)
+  stats.estimated_shortfall_inr  → max(0, total_amount_due - cash_balance)
+  stats.critical_count           → count of STATUTORY + SECURED_LOAN obligations
+  stats.days_to_critical         → days from today to nearest STATUTORY/SECURED_LOAN due date (null if none)
 
-• If INGEST (duplicate detected, same ref_id already exists):
-  English: "⚠️ Duplicate detected. This transaction (Sharma Papers ₹50,000 on 28 Mar) was already recorded. Skipped."
+━━━━━━━━━━━━━━━━━━━━━━━━━━━
+STEP 5 — GENERATE BOT REPLY (ALWAYS INCLUDE ₹ NUMBERS)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━
+The bot_reply MUST: be 2–4 sentences, always include ₹ amounts, show cash snapshot, mention most urgent obligation.
+
+• INGEST (English, no shortfall):
+  "✅ Logged {N} obligation(s) totalling ₹{total}. Cash ₹{cash} — you're covered! Most urgent: {party} ₹{amt} due {date}."
+
+• INGEST (English, shortfall):
+  "✅ Logged {N} obligation(s) totalling ₹{total}. Cash ₹{cash}. ⚠️ Shortfall of ₹{shortfall} — pay {party} ₹{amt} due {date} first!"
+
+• INGEST (Tamil, no shortfall):
+  "✅ {N} கடமை(கள்) பதிவு — மொத்தம் ₹{total}. கையில் ₹{cash} — போதுமானது! {party} ₹{amt} முதலில் கட்டுங்கள்."
+
+• INGEST (Tamil, shortfall):
+  "✅ {N} கடமை(கள்) பதிவு — மொத்தம் ₹{total}. கையில் ₹{cash}. ⚠️ ₹{shortfall} குறைபாடு — {party} ₹{amt} உடனே கட்டவும்!"
+
+• INGEST (duplicate detected):
+  English: "⚠️ Already recorded: {party} ₹{amount} on {date}. Skipped to avoid duplicate."
   Tamil: "⚠️ இந்த பரிவர்த்தனை ஏற்கனவே பதிவு செய்யப்பட்டது. தவிர்க்கப்பட்டது."
 
-• If STATUS:
-  English: "Sure! Analysing your current cash flow…"
-  Tamil: "சரி! உங்கள் தற்போதைய நிதி நிலையை ஆராய்கிறேன்…"
+• STATUS (English): "Sure! Let me crunch your numbers — pulling up your full cash flow picture with payment priorities."
+• STATUS (Tamil): "சரி! உங்கள் நிதி நிலையை ஆராய்கிறேன்…"
 
-• If FILTER:
-  English: "Fetching matching records…"
-  Tamil: "பொருந்தும் பதிவுகளை தேடுகிறேன்…"
+• FILTER (English): "Searching for {filter description}. Here are your matching transactions and obligations."
+• FILTER (Tamil): "'{filter description}' தொடர்பான பதிவுகளை தேடுகிறேன்…"
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━
-OUTPUT FORMAT (STRICT)
+OUTPUT FORMAT (STRICT — return ONLY valid JSON)
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━
-Return ONLY valid JSON — no markdown, no explanation:
-
 {
   "intent": "INGEST|STATUS|FILTER",
-  "bot_reply": "short natural language reply in Tamil or English",
+  "bot_reply": "conversational reply with ₹ numbers — ALWAYS include concrete amounts",
   "cash_balance_inr": <number or 0>,
   "obligations": [
     {
@@ -279,39 +296,47 @@ Return ONLY valid JSON — no markdown, no explanation:
     "medium": null,
     "date_from": null,
     "date_to": null
+  },
+  "stats": {
+    "obligations_this_message": <int>,
+    "total_amount_due_inr": <number>,
+    "cash_balance_inr": <number>,
+    "estimated_shortfall_inr": <number>,
+    "critical_count": <int>,
+    "days_to_critical": <int or null>
   }
 }
 
 RULES:
-- obligations → only populate for INGEST intent
-- filter_query → only populate for FILTER intent
-- obligations and filter_query → EMPTY for STATUS intent
-- cash_balance_inr → what the user HAS (not owes). 0 if not mentioned.
-- Amount: always a plain number. NEVER commas, currency symbols, or strings.
-- NEVER invent obligations not mentioned by the user.
-- NEVER compute scores — your job is EXTRACTION ONLY.
+- obligations → only for INGEST intent
+- filter_query → only for FILTER intent
+- stats → ALWAYS present in EVERY response
+- cash_balance_inr → what the user HAS (not owes). 0 if unknown.
+- Amount: plain number only. NEVER commas, symbols, strings.
+- NEVER invent obligations not mentioned.
+- NEVER compute consequence scores — extraction and stats only.
 
 FEW-SHOT EXAMPLES:
 
-Example A (INGEST, English):
+Example A (INGEST, English, solvent):
 User: "cash 2L, gst 40k by 20th and rent 30k end of month"
-Output: {"intent":"INGEST","bot_reply":"✅ Got it! Recorded 2 obligations — GST ₹40,000 due 20 Mar and Landlord ₹30,000 due 31 Mar.","cash_balance_inr":200000,"obligations":[{"counterparty_name":"GST","description":"Monthly GST filing","amount_inr":40000,"category":"STATUTORY","due_date":"2026-03-20","flexibility":"FIXED"},{"counterparty_name":"Landlord","description":"Office rent","amount_inr":30000,"category":"RENT","due_date":"2026-03-31","flexibility":"NEGOTIABLE"}],"filter_query":{}}
+Output: {"intent":"INGEST","bot_reply":"✅ Logged 2 obligations totalling ₹70,000. Cash ₹2,00,000 — you're fully covered! Most urgent: GST ₹40,000 due 20 Mar (statutory, never defer).","cash_balance_inr":200000,"obligations":[{"counterparty_name":"GST","description":"Monthly GST filing","amount_inr":40000,"category":"STATUTORY","due_date":"2026-03-20","flexibility":"FIXED"},{"counterparty_name":"Landlord","description":"Office rent","amount_inr":30000,"category":"RENT","due_date":"2026-03-31","flexibility":"NEGOTIABLE"}],"filter_query":{},"stats":{"obligations_this_message":2,"total_amount_due_inr":70000,"cash_balance_inr":200000,"estimated_shortfall_inr":0,"critical_count":1,"days_to_critical":3}}
 
-Example B (INGEST, Tamil):
-User: "கையில் 1.5 லட்சம் இருக்கு. சப்ளையர்க்கு 80k கொடுக்கணும், ஸ்டாஃப் சம்பளம் 60k"
-Output: {"intent":"INGEST","bot_reply":"✅ சரி! 2 கடமைகள் பதிவு செய்யப்பட்டது — Supplier ₹80,000 மற்றும் Staff ₹60,000.","cash_balance_inr":150000,"obligations":[{"counterparty_name":"Supplier","description":"Supplier payment","amount_inr":80000,"category":"TRADE_PAYABLE","due_date":"2026-04-02","flexibility":"DEFERRABLE"},{"counterparty_name":"Staff","description":"Monthly salary","amount_inr":60000,"category":"SALARY","due_date":"2026-03-31","flexibility":"NEGOTIABLE"}],"filter_query":{}}
+Example B (INGEST, Tamil, shortfall):
+User: "கையில் 80k இருக்கு. சப்ளையர்க்கு 60k, GST 40k"
+Output: {"intent":"INGEST","bot_reply":"✅ 2 கடமைகள் பதிவு — மொத்தம் ₹1,00,000. கையில் ₹80,000. ⚠️ ₹20,000 குறைபாடு — GST ₹40,000 முதலில் கட்டவும்!","cash_balance_inr":80000,"obligations":[{"counterparty_name":"Supplier","description":"Supplier payment","amount_inr":60000,"category":"TRADE_PAYABLE","due_date":"2026-04-02","flexibility":"DEFERRABLE"},{"counterparty_name":"GST","description":"Monthly GST","amount_inr":40000,"category":"STATUTORY","due_date":"2026-04-20","flexibility":"FIXED"}],"filter_query":{},"stats":{"obligations_this_message":2,"total_amount_due_inr":100000,"cash_balance_inr":80000,"estimated_shortfall_inr":20000,"critical_count":1,"days_to_critical":25}}
 
 Example C (STATUS):
 User: "what should I pay first?"
-Output: {"intent":"STATUS","bot_reply":"Sure! Analysing your current cash flow…","cash_balance_inr":0,"obligations":[],"filter_query":{}}
+Output: {"intent":"STATUS","bot_reply":"Sure! Let me crunch your numbers — pulling up your full cash flow picture with payment priorities right away.","cash_balance_inr":0,"obligations":[],"filter_query":{},"stats":{"obligations_this_message":0,"total_amount_due_inr":0,"cash_balance_inr":0,"estimated_shortfall_inr":0,"critical_count":0,"days_to_critical":null}}
 
 Example D (FILTER):
 User: "show all payments to shaarma papers this month"
-Output: {"intent":"FILTER","bot_reply":"Fetching matching records…","cash_balance_inr":0,"obligations":[],"filter_query":{"counterparty_name":"Sharma Papers","date_from":"2026-03-01","date_to":"2026-03-31"}}
+Output: {"intent":"FILTER","bot_reply":"Searching for all Sharma Papers transactions in March. I'll show you amounts, dates, and payment methods.","cash_balance_inr":0,"obligations":[],"filter_query":{"counterparty_name":"Sharma Papers","date_from":"2026-03-01","date_to":"2026-03-31"},"stats":{"obligations_this_message":0,"total_amount_due_inr":0,"cash_balance_inr":0,"estimated_shortfall_inr":0,"critical_count":0,"days_to_critical":null}}
 
-Example E (INGEST — Name normalisation):
+Example E (INGEST, name normalisation, no cash given):
 User: "I paid shaarmapapers 50000 by cheque"
-Output: {"intent":"INGEST","bot_reply":"✅ Got it! Recorded payment of ₹50,000 to Sharma Papers via Bank Cheque.","cash_balance_inr":0,"obligations":[{"counterparty_name":"Sharma Papers","description":"Cheque payment","amount_inr":50000,"category":"TRADE_PAYABLE","due_date":"2026-03-26","flexibility":"DEFERRABLE"}],"filter_query":{}}
+Output: {"intent":"INGEST","bot_reply":"✅ Logged 1 payment: Sharma Papers ₹50,000 via cheque. Share your current cash balance so I can check your overall position!","cash_balance_inr":0,"obligations":[{"counterparty_name":"Sharma Papers","description":"Cheque payment","amount_inr":50000,"category":"TRADE_PAYABLE","due_date":"2026-03-26","flexibility":"DEFERRABLE"}],"filter_query":{},"stats":{"obligations_this_message":1,"total_amount_due_inr":50000,"cash_balance_inr":0,"estimated_shortfall_inr":50000,"critical_count":0,"days_to_critical":null}}
 """
 
 
@@ -319,15 +344,15 @@ def groq_parse_input(
     raw_text: str,
     reference_date: Optional[date] = None,
 ) -> Optional[dict]:
-    """Use Groq llama3-8b to extract intent + obligations + filter_query + bot_reply.
+    """Use Groq llama-3.1-8b-instant to extract intent + obligations + filter_query + bot_reply + stats.
     Returns the full parsed dict with keys:
-      intent, bot_reply, cash_balance_inr, obligations, filter_query.
+      intent, bot_reply, cash_balance_inr, obligations, filter_query, stats.
     Returns None if unavailable or failed.
     """
     ref = reference_date or date.today()
     prompt = f"Today's date: {ref.isoformat()}\n\nUser message:\n{raw_text}"
 
-    result = _groq_chat(MODEL_PARSE, _PARSE_SYSTEM, prompt, max_tokens=1500)
+    result = _groq_chat(MODEL_PARSE, _PARSE_SYSTEM, prompt, max_tokens=2000)
     if result is None:
         return None
 
@@ -536,6 +561,75 @@ def groq_draft_email(
 
 
 # ─────────────────────────────────────────────
+# 5. VISION OCR — llama-3.2-11b-vision-preview
+# ─────────────────────────────────────────────
+
+MODEL_VISION = "meta-llama/llama-4-scout-17b-16e-instruct"
+_VISION_FALLBACK = "llama-3.2-90b-vision-preview"  # fallback if primary fails
+
+_VISION_OCR_SYSTEM = """You are a financial document OCR specialist.
+Extract ALL text from the provided image exactly as it appears.
+Focus on: amounts (₹, Rs., numbers), dates, party names, payment terms.
+Return the extracted text as plain text only — no JSON, no markdown, no commentary.
+Preserve line breaks and structure as much as possible."""
+
+
+def groq_vision_ocr(image_bytes: bytes, mime_type: str = "image/jpeg") -> Optional[str]:
+    """Use Groq vision model to extract text from an image via OCR.
+
+    Args:
+        image_bytes: Raw image bytes (JPEG, PNG, WEBP, etc.)
+        mime_type: MIME type of the image (default: image/jpeg)
+
+    Returns:
+        Extracted text string, or None if unavailable/failed.
+    """
+    if not _GROQ_AVAILABLE or _client is None:
+        return None
+
+    import base64, io as _io
+
+    # Convert PNG→JPEG for better model compatibility
+    if mime_type == "image/png":
+        try:
+            from PIL import Image as _Img
+            pil = _Img.open(_io.BytesIO(image_bytes)).convert("RGB")
+            buf = _io.BytesIO()
+            pil.save(buf, format="JPEG", quality=90)
+            image_bytes = buf.getvalue()
+            mime_type = "image/jpeg"
+            logger.info("Converted PNG->JPEG (%d bytes)", len(image_bytes))
+        except Exception:
+            pass  # use original bytes
+
+    b64 = base64.standard_b64encode(image_bytes).decode("utf-8")
+    data_url = f"data:{mime_type};base64,{b64}"
+    messages = [{"role": "user", "content": [
+        {"type": "image_url", "image_url": {"url": data_url}},
+        {"type": "text", "text": (
+            "Extract all text from this financial document image. "
+            "Include all amounts, dates, party names, and payment details. "
+            "Return plain text only."
+        )},
+    ]}]
+
+    for model in (MODEL_VISION, _VISION_FALLBACK):
+        try:
+            response = _client.chat.completions.create(
+                model=model, messages=messages, temperature=0, max_tokens=2048,
+            )
+            content = response.choices[0].message.content
+            if content and content.strip():
+                extracted = content.strip()
+                logger.info("Groq Vision OCR (%s) extracted %d chars", model, len(extracted))
+                return extracted
+        except Exception as e:
+            logger.warning("Groq Vision OCR (%s) failed: %s", model, e)
+
+    return None
+
+
+# ─────────────────────────────────────────────
 # PUBLIC STATUS
 # ─────────────────────────────────────────────
 
@@ -551,4 +645,5 @@ def get_groq_status() -> dict:
         "parse_model": MODEL_PARSE,
         "fixjson_model": MODEL_FIXJSON,
         "narrate_model": MODEL_NARRATE,
+        "vision_model": MODEL_VISION,
     }

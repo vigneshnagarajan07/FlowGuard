@@ -104,6 +104,8 @@
     .btn-p{flex:1;background:#2563eb;color:#fff;border:none;padding:14px;border-radius:12px;font-weight:600;cursor:pointer;transition:all .2s;font-size:15px}
     .btn-p:hover{background:#1d4ed8;transform:translateY(-1px);box-shadow:0 4px 12px rgba(37,99,235,0.25)}
     .btn-s{background:#f1f5f9;color:#475569;border:none;padding:14px 20px;border-radius:12px;font-weight:600;cursor:pointer}
+    .badge-n{display:none;position:absolute;top:-4px;right:-4px;width:16px;height:16px;background:#ef4444;color:#fff;border-radius:50%;font-size:10px;align-items:center;justify-content:center;font-weight:700}
+
   </style>
 </head>
 <body>
@@ -188,10 +190,8 @@
 </div>
 
 <script>
-// If opened via file:// disk, location.origin is "null" — fall back to the backend server.
-const API = (location.protocol === 'file:' || location.origin === 'null')
-  ? 'http://localhost:8000'
-  : location.origin;
+// Always point to the FastAPI backend. If served via Live Server or file://, use localhost:8000.
+const API = (location.port === '8000') ? location.origin : 'http://localhost:8000';
 let busy=false, pFile=null;
 const $=id=>document.getElementById(id);
 const esc=s=>String(s||'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
@@ -199,20 +199,34 @@ const ts=()=>new Date().toLocaleTimeString('en-IN',{hour:'2-digit',minute:'2-dig
 function rz(el){el.style.height='auto';el.style.height=Math.min(el.scrollHeight,100)+'px'}
 function scr(){const c=$('chat');c.scrollTop=c.scrollHeight}
 
-// Profile Onboarding
-async function checkProfile(){
-  try {
-    const r=await fetch(API+'/profile');
-    const d=await r.json();
-    if(!d.business_name){
-      $('mOv').style.display='flex';
-    } else {
-      $('mOv').style.display='none';
-      if($('wel')) $('wel').innerHTML = `<div style="font-size:40px;margin-bottom:8px">🏢</div><b style="font-size:18px">Welcome back, ${esc(d.full_name||'User')}</b><p>Managing cash flow for <b>${esc(d.business_name)}</b>.<br><br>Type your obligations or attach a file below.</p>`;
-    }
-  } catch(e) { console.error("Profile check failed", e); }
+// Profile stored in sessionStorage so modal always shows on fresh browser load
+let _profile = {};
+function checkProfile(){
+  const stored = sessionStorage.getItem('fg_profile');
+  if(stored){
+    try{ _profile = JSON.parse(stored); }catch{}
+  }
+  if(!_profile.business_name){
+    $('mOv').style.display='flex';
+  } else {
+    $('mOv').style.display='none';
+    if($('wel')) $('wel').innerHTML = `<div style="font-size:40px;margin-bottom:8px">🏢</div><b style="font-size:18px">Welcome back, ${esc(_profile.full_name||'User')}</b><p>Managing cash flow for <b>${esc(_profile.business_name)}</b> · ${esc(_profile.industry||'')} · ${esc(_profile.annual_turnover||'')}.<br><br>Type your obligations or attach a file below.</p>`;
+  }
 }
 window.onload = checkProfile;
+
+// Returns a short context string injected into every Groq request
+function getProfileContext(){
+  if(!_profile.business_name) return '';
+  const parts = [
+    `Business: ${_profile.business_name}`,
+    _profile.industry ? `Industry: ${_profile.industry}` : '',
+    _profile.annual_turnover ? `Turnover: ${_profile.annual_turnover}` : '',
+    _profile.business_description ? `About: ${_profile.business_description}` : '',
+    _profile.gstin ? `GSTIN: ${_profile.gstin}` : '',
+  ].filter(Boolean);
+  return `[Business Context — ${parts.join(' | ')}]\n`;
+}
 
 async function saveProfile(){
   const data = {
@@ -224,17 +238,15 @@ async function saveProfile(){
     annual_turnover: $('m_turn').value
   };
   if(!data.business_name) { alert("Please enter your business name."); return; }
-  
-  try {
-    const r=await fetch(API+'/profile',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(data)});
-    if(r.ok) {
-      $('mOv').style.display='none';
-      const d = await r.json();
-      $('chat').insertAdjacentHTML('beforeend', `<div class="row bot"><div class="bubble">✅ <b>Profile Updated!</b><br>Nice to meet you, ${esc(d.full_name)}. I'm ready to help manage <b>${esc(d.business_name)}</b>'s cash flow.</div><div class="time">${ts()}</div></div>`);
-      if($('wel')) $('wel').remove();
-      scr();
-    }
-  } catch(e) { alert("Error saving profile. Try again."); }
+  // Save to sessionStorage immediately (fast, no server wait)
+  _profile = data;
+  sessionStorage.setItem('fg_profile', JSON.stringify(data));
+  // Also persist to server async
+  fetch(API+'/profile',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(data)}).catch(()=>{});
+  $('mOv').style.display='none';
+  $('chat').insertAdjacentHTML('beforeend', `<div class="row bot"><div class="bubble">✅ <b>Profile Saved!</b><br>Welcome, ${esc(data.full_name)}. I'm your personal CFO advisor for <b>${esc(data.business_name)}</b> (${esc(data.industry)}, ${esc(data.annual_turnover)}). Let's manage your cash flow!</div><div class="time">${ts()}</div></div>`);
+  if($('wel')) $('wel').remove();
+  scr();
 }
 
 // Status
@@ -323,7 +335,7 @@ function handleReply(data) {
 function uploadEndpoint(name){
 
   const e=name.split('.').pop().toLowerCase();
-  if(e==='csv')return'/upload/csv';
+  if(['csv','xlsx','xls'].includes(e))return'/upload/csv';
   if(e==='pdf')return'/upload/pdf';
   if(['jpg','jpeg','png','webp','bmp','tiff'].includes(e))return'/upload/image';
   return null;
@@ -394,7 +406,7 @@ async function go(){
     
     // Run pipeline with text
     try{
-      const res=await fetch(API+'/pipeline',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({raw_text:text,language:'en'})});
+      const res=await fetch(API+'/pipeline',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({raw_text:getProfileContext()+text,language:'en'})});
       rmTyping();
       if(!res.ok){const e=await res.json().catch(()=>({}));addErr('Error: '+(e.detail||e.error||'HTTP '+res.status))}
       else handleReply(await res.json());
@@ -413,10 +425,11 @@ async function go(){
   addMe(text);addTyping();
 
   try{
-    const res=await fetch(API+'/pipeline',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({raw_text:text,language:'en'})});
+    const res=await fetch(API+'/pipeline',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({raw_text:getProfileContext()+text,language:'en'})});
     rmTyping();
     if(!res.ok){const e=await res.json().catch(()=>({}));addErr('Error: '+(e.detail||e.error||'HTTP '+res.status))}
-    else addCard(await res.json());
+    else handleReply(await res.json());
+
   }catch{rmTyping();addErr('Cannot reach engine. Make sure the server is running.')}
   finally{busy=false;$('sb').disabled=false;inp.focus()}
 }

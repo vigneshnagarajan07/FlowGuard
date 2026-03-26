@@ -53,19 +53,15 @@ except ImportError:
     CAMELOT_AVAILABLE = False
     logger.warning("camelot-py not installed — PDF table extraction disabled")
 
-# OCR: PaddleOCR
+# OCR: Groq Vision API (no local dependencies required)
+# pypdfium2 is already installed (comes with pdfplumber) — used to render PDF pages to images
 try:
-    from paddleocr import PaddleOCR
-    try:
-        _paddle_ocr = PaddleOCR(use_angle_cls=True, lang="en", show_log=False)
-    except (ValueError, TypeError):
-        # Older paddleocr versions don't support show_log
-        _paddle_ocr = PaddleOCR(use_angle_cls=True, lang="en")
-    OCR_AVAILABLE = True
-except Exception:
-    OCR_AVAILABLE = False
-    _paddle_ocr = None
-    logger.warning("paddleocr not available — OCR import disabled")
+    import pypdfium2 as pdfium
+    PDFIUM_AVAILABLE = True
+except ImportError:
+    PDFIUM_AVAILABLE = False
+
+OCR_AVAILABLE = True  # Always available via Groq Vision when API key is set
 
 
 # CSV: Pandas
@@ -94,7 +90,7 @@ from .database import (
     record_transaction,
     generate_txn_ref_id,
 )
-from .groq_client import groq_parse_input, is_groq_available
+from .groq_client import groq_parse_input, groq_vision_ocr, is_groq_available
 from .parser import parse_text_to_obligations
 
 
@@ -390,6 +386,7 @@ _COL_MAP = {
     "details": "description", "notes": "description",
     # Transaction columns
     "medium": "medium", "mode": "medium", "payment_mode": "medium",
+    "payment_method": "medium",
     "direction": "direction", "txn_type": "direction",
     "reference": "external_ref", "ref": "external_ref",
     "ref_id": "external_ref", "txn_id": "external_ref",
@@ -398,7 +395,7 @@ _COL_MAP = {
 
 
 def import_csv(content: bytes, filename: str = "upload.csv") -> ImportResult:
-    """Import obligations/transactions from a CSV file using Pandas."""
+    """Import obligations/transactions from a CSV or XLSX file using Pandas."""
     result = ImportResult(filename, "CSV")
     file_hash = compute_file_hash(content)
     result.file_hash = file_hash
@@ -412,10 +409,16 @@ def import_csv(content: bytes, filename: str = "upload.csv") -> ImportResult:
             result.error = f"File already imported on {existing.imported_at}"
             return result
 
-        text = content.decode("utf-8-sig")
+        is_excel = filename.lower().endswith(('.xlsx', '.xls'))
 
         if PANDAS_AVAILABLE:
-            df = pd.read_csv(io.StringIO(text))
+            if is_excel:
+                df = pd.read_excel(io.BytesIO(content))
+                result.file_type = "EXCEL"
+            else:
+                text = content.decode("utf-8-sig")
+                df = pd.read_csv(io.StringIO(text))
+
             # Normalize column names
             rename_map = {}
             for col in df.columns:
@@ -427,11 +430,17 @@ def import_csv(content: bytes, filename: str = "upload.csv") -> ImportResult:
             has_party = "counterparty_name" in df.columns
             has_amount = "amount_inr" in df.columns
 
+            # Smart fallback: use description as counterparty if no party column
+            if not has_party and "description" in df.columns:
+                df["counterparty_name"] = df["description"]
+                has_party = True
+
             if not has_party or not has_amount:
-                # Fallback: send entire CSV to Groq for structuring
+                # Fallback: send raw text to Groq for structuring
+                raw_text = df.to_string() if PANDAS_AVAILABLE else content.decode("utf-8-sig", errors="replace")
                 if is_groq_available():
                     logger.info("CSV columns unrecognized, routing to Groq LLM")
-                    structured = _groq_structure_file(text)
+                    structured = _groq_structure_file(raw_text)
                     if structured:
                         _validate_and_store_obligations(
                             db, structured.get("obligations", []),
@@ -444,9 +453,13 @@ def import_csv(content: bytes, filename: str = "upload.csv") -> ImportResult:
                         result.success = True
                         record_file_import(db, file_hash, filename, "CSV", len(content),
                                            len(result.obligations), result.new_count,
-                                           result.updated_count, text[:2000])
+                                           result.updated_count, raw_text[:2000])
                         return result
-                result.error = "Could not find required columns: counterparty AND amount"
+                result.error = (
+                    "CSV/Excel must have columns for counterparty (e.g. 'vendor', 'party', 'name') "
+                    "and amount (e.g. 'amount', 'amt', 'total'). "
+                    f"Found columns: {list(df.columns)}"
+                )
                 return result
 
             # Detect if this is a transaction file (has direction/medium columns)
@@ -495,8 +508,9 @@ def import_csv(content: bytes, filename: str = "upload.csv") -> ImportResult:
                     _validate_and_store_obligations(db, [row_dict], "CSV", file_hash, result)
 
         else:
-            # Fallback: stdlib csv + Groq
+            # Fallback: stdlib csv + Groq (pandas not available)
             import csv
+            text = content.decode("utf-8-sig", errors="replace")
             reader = csv.DictReader(io.StringIO(text))
             if is_groq_available():
                 structured = _groq_structure_file(text)
@@ -511,9 +525,14 @@ def import_csv(content: bytes, filename: str = "upload.csv") -> ImportResult:
                     )
 
         result.success = True
-        record_file_import(db, file_hash, filename, "CSV", len(content),
+        # Safe preview: Excel files never have a `text` variable
+        if is_excel:
+            preview_text = df.to_string()[:2000] if PANDAS_AVAILABLE and 'df' in dir() else ""
+        else:
+            preview_text = (text[:2000] if 'text' in dir() and text else content.decode("utf-8-sig", errors="replace")[:2000])
+        record_file_import(db, file_hash, filename, result.file_type, len(content),
                            len(result.obligations), result.new_count,
-                           result.updated_count, text[:2000])
+                           result.updated_count, preview_text)
 
     except Exception as e:
         result.error = str(e)
@@ -586,8 +605,33 @@ def import_pdf(content: bytes, filename: str = "upload.pdf") -> ImportResult:
         full_text = "\n".join(pages_text)
         result.raw_text = full_text
 
+        # Scanned PDF fallback: if pdfplumber found no text, render pages and use Groq Vision OCR
+        if not full_text.strip() and PDFIUM_AVAILABLE and is_groq_available():
+            logger.info("PDF has no extractable text — trying Groq Vision OCR on rendered pages")
+            vision_texts = []
+            try:
+                doc = pdfium.PdfDocument(io.BytesIO(content))
+                for page_idx in range(min(len(doc), 10)):  # cap at 10 pages
+                    page = doc[page_idx]
+                    bitmap = page.render(scale=2)  # 2x scale for better OCR
+                    pil_image = bitmap.to_pil()
+                    # Convert to JPEG bytes
+                    img_buffer = io.BytesIO()
+                    pil_image.save(img_buffer, format="JPEG", quality=90)
+                    page_text = groq_vision_ocr(img_buffer.getvalue(), mime_type="image/jpeg")
+                    if page_text:
+                        vision_texts.append(f"--- Page {page_idx + 1} ---\n{page_text}")
+                doc.close()
+            except Exception as e:
+                logger.warning("PDF Vision OCR failed: %s", e)
+
+            if vision_texts:
+                full_text = "\n\n".join(vision_texts)
+                result.raw_text = full_text
+                logger.info("Groq Vision OCR extracted %d chars from scanned PDF", len(full_text))
+
         if not full_text.strip():
-            result.error = "No text could be extracted from the PDF"
+            result.error = "No text could be extracted from the PDF (tried text + Vision OCR)"
             return result
 
         # 3. Route through Groq LLM for structuring
@@ -625,11 +669,11 @@ def import_pdf(content: bytes, filename: str = "upload.pdf") -> ImportResult:
 # ─────────────────────────────────────────────
 
 def import_image(content: bytes, filename: str = "upload.jpg") -> ImportResult:
-    """OCR via PaddleOCR → Groq LLM → validate → store."""
+    """OCR via Groq Vision API → Groq LLM → validate → store."""
     result = ImportResult(filename, "IMAGE")
 
-    if not OCR_AVAILABLE:
-        result.error = "PaddleOCR not installed. Run: pip install paddleocr paddlepaddle"
+    if not is_groq_available():
+        result.error = "Groq API key not configured. Set GROQ_API_KEY in .env to enable image OCR."
         return result
 
     file_hash = compute_file_hash(content)
@@ -644,50 +688,38 @@ def import_image(content: bytes, filename: str = "upload.jpg") -> ImportResult:
             result.error = f"File already imported on {existing.imported_at}"
             return result
 
-        # Save to temp file for PaddleOCR (it needs a file path or numpy array)
-        import tempfile, os, numpy as np
-        
-        if PIL_AVAILABLE:
-            img = Image.open(io.BytesIO(content)).convert("RGB")
-            img_array = np.array(img)
-        else:
-            # Write to temp file
-            with tempfile.NamedTemporaryFile(suffix=".jpg", delete=False) as tmp:
-                tmp.write(content)
-                tmp_path = tmp.name
-            img_array = tmp_path
+        # Detect MIME type from filename extension
+        ext = filename.lower().rsplit(".", 1)[-1] if "." in filename else "jpg"
+        mime_map = {
+            "jpg": "image/jpeg", "jpeg": "image/jpeg",
+            "png": "image/png", "webp": "image/webp",
+            "bmp": "image/bmp", "tiff": "image/tiff",
+        }
+        mime_type = mime_map.get(ext, "image/jpeg")
 
-        # Run PaddleOCR
-        ocr_results = _paddle_ocr.ocr(img_array, cls=True)
-
-        # Extract text lines
-        lines = []
-        if ocr_results:
-            for page_result in ocr_results:
-                if page_result:
-                    for line in page_result:
-                        if line and len(line) >= 2:
-                            text_info = line[1]
-                            if isinstance(text_info, tuple) and len(text_info) >= 1:
-                                lines.append(text_info[0])
-                            elif isinstance(text_info, str):
-                                lines.append(text_info)
-
-        raw_text = "\n".join(lines)
-        result.raw_text = raw_text
-
-        # Clean up temp file if used
-        if not PIL_AVAILABLE and isinstance(img_array, str):
+        # Optionally compress large images before sending to Groq
+        image_bytes = content
+        if PIL_AVAILABLE and len(content) > 4_000_000:  # > 4MB
             try:
-                os.unlink(img_array)
-            except:
-                pass
+                img = Image.open(io.BytesIO(content)).convert("RGB")
+                img.thumbnail((2048, 2048))  # cap resolution
+                buf = io.BytesIO()
+                img.save(buf, format="JPEG", quality=85)
+                image_bytes = buf.getvalue()
+                mime_type = "image/jpeg"
+                logger.info("Image compressed: %d → %d bytes", len(content), len(image_bytes))
+            except Exception as e:
+                logger.warning("Image compression failed, using original: %s", e)
 
-        if not raw_text.strip():
-            result.error = "No text could be extracted from the image (OCR returned empty)"
+        # Run Groq Vision OCR
+        raw_text = groq_vision_ocr(image_bytes, mime_type)
+
+        if not raw_text or not raw_text.strip():
+            result.error = "Groq Vision OCR returned no text from this image."
             return result
 
-        logger.info("PaddleOCR extracted %d chars from %s", len(raw_text), filename)
+        result.raw_text = raw_text
+        logger.info("Vision OCR extracted %d chars from %s", len(raw_text), filename)
 
         # Route through Groq LLM for structuring
         structured = _groq_structure_file(raw_text)
@@ -725,14 +757,16 @@ def import_image(content: bytes, filename: str = "upload.jpg") -> ImportResult:
 
 def get_import_capabilities() -> dict:
     """Return which file import features are available."""
+    groq_ok = is_groq_available()
     return {
         "csv": True,
         "csv_engine": "pandas" if PANDAS_AVAILABLE else "stdlib",
         "pdf_text": PDF_AVAILABLE,
         "pdf_tables": CAMELOT_AVAILABLE,
-        "ocr": OCR_AVAILABLE,
-        "ocr_engine": "paddleocr" if OCR_AVAILABLE else "none",
-        "llm": is_groq_available(),
-        "llm_model": "groq-llama3",
+        "pdf_scanned_ocr": PDF_AVAILABLE and PDFIUM_AVAILABLE and groq_ok,
+        "ocr": groq_ok,
+        "ocr_engine": "groq-vision (llama-3.2-11b-vision-preview)" if groq_ok else "none",
+        "llm": groq_ok,
+        "llm_model": "groq-llama-3.1-8b-instant",
         "validation": "pydantic",
     }

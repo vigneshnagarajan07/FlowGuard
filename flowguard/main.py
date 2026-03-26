@@ -56,6 +56,7 @@ from fastapi import FastAPI, File, HTTPException, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse
 from pydantic import BaseModel, Field
+from contextlib import asynccontextmanager
 
 # Project root for serving static files
 _PROJECT_ROOT = Path(__file__).resolve().parent.parent
@@ -229,6 +230,11 @@ class HealthResponse(BaseModel):
     sentence_transformers_available: bool
     timestamp: datetime
 
+@asynccontextmanager
+async def lifespan(app):
+    init_db()
+    logger.info("FlowGuard database initialized")
+    yield
 
 # ─────────────────────────────────────────────
 # APP
@@ -246,6 +252,7 @@ app = FastAPI(
         "See `/health` to confirm which libraries are loaded."
     ),
     version=ENGINE_VERSION,
+    lifespan=lifespan,   # ← ADD THIS LINE  
 )
 
 app.add_middleware(
@@ -528,7 +535,6 @@ async def narrate(req: NLPNarrateRequest) -> NarrateResponse:
 
 @app.post(
     "/pipeline",
-    response_model=PipelineResponse,
     tags=["WhatsApp Bot"],
     summary="ONE-SHOT: Human text → full narrated decisions",
     description=(
@@ -577,6 +583,7 @@ async def pipeline(req: NLPParseRequest):
                         "flexibility":       ob.flexibility if isinstance(ob.flexibility, str) else ob.flexibility.value,
                         "description":       ob.description,
                         "obligation_id":     ob.obligation_id,
+                        "penalty_rate_annual_pct": ob.penalty_rate_annual_pct,  # ← ADD
                     }
                     row, is_new = upsert_obligation(db, ob_dict, "CHAT", None)
                     stored_obs.append({
@@ -818,14 +825,7 @@ async def list_audits():
     return _audit_store.list_ids()
 
 
-# ─────────────────────────────────────────────
-# DATABASE INIT ON STARTUP
-# ─────────────────────────────────────────────
 
-@app.on_event("startup")
-def startup_event():
-    init_db()
-    logger.info("FlowGuard database initialized")
 
 
 # ─────────────────────────────────────────────
@@ -948,7 +948,7 @@ async def save_profile(profile_data: UserProfile):
     """Create or update the business and personal profile."""
     db = SessionLocal()
     try:
-        profile = update_user_profile(db, profile_data.dict(exclude_unset=True))
+        profile = update_user_profile(db, profile_data.model_dump(exclude_unset=True))
         return profile.to_dict()
     finally:
         db.close()
@@ -1085,9 +1085,11 @@ _MEDIUM_DESC = {
 # UI — CHAT INTERFACE
 # ─────────────────────────────────────────────
 
+@app.get("/", include_in_schema=False)
 @app.get("/chat", include_in_schema=False)
+@app.get("/chat.html", include_in_schema=False)
 async def chat_ui():
-    """Serve the FlowGuard chat UI."""
+    """Serve the FlowGuard chat UI — open http://localhost:8000 directly, no Live Server needed."""
     chat_path = _PROJECT_ROOT / "chat.html"
     if not chat_path.exists():
         raise HTTPException(status_code=404, detail="chat.html not found.")
